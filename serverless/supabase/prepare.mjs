@@ -28,8 +28,45 @@ function normalizeLf(text) {
   return text.replace(/\r\n/g, "\n");
 }
 
+/** Builds a cloud-compatible `CREATE OR REPLACE FUNCTION public.sync_restore_account_backup` from baseline SQL. */
+function buildCloudSafeSyncRestoreAccountBackup(baselineSql) {
+  const fnMatch = baselineSql.match(
+    /CREATE FUNCTION public\.sync_restore_account_backup\(p_backup jsonb, p_mode text DEFAULT 'replace'::text\) RETURNS jsonb\n[\s\S]*?\nEND;\n\$_\$;/,
+  );
+  if (!fnMatch) {
+    throw new Error("Could not locate sync_restore_account_backup definition in baseline migration");
+  }
+
+  let fnSql = fnMatch[0];
+  fnSql = fnSql.replace(
+    "CREATE FUNCTION public.sync_restore_account_backup(p_backup jsonb, p_mode text DEFAULT 'replace'::text) RETURNS jsonb",
+    "CREATE OR REPLACE FUNCTION public.sync_restore_account_backup(p_backup jsonb, p_mode text DEFAULT 'replace'::text) RETURNS jsonb",
+  );
+  fnSql = fnSql.replace(
+    "    SET search_path TO 'public'",
+    "    SET search_path = pg_catalog, public, auth, extensions, pg_temp",
+  );
+  fnSql = fnSql.replace(
+    "    v_counts jsonb;\nBEGIN",
+    "    v_counts jsonb;\n    v_prev_skip_defaults text;\nBEGIN\n    v_prev_skip_defaults := COALESCE(pg_catalog.current_setting('nuvio.skip_profile_defaults', true), '');\n    PERFORM pg_catalog.set_config('nuvio.skip_profile_defaults', 'on', true);",
+  );
+  fnSql = fnSql.replace(
+    "    RETURN jsonb_build_object(",
+    "    PERFORM pg_catalog.set_config('nuvio.skip_profile_defaults', v_prev_skip_defaults, true);\n\n    RETURN jsonb_build_object(",
+  );
+
+  if (
+    !fnSql.includes("PERFORM pg_catalog.set_config('nuvio.skip_profile_defaults', 'on', true);") ||
+    !fnSql.includes("PERFORM pg_catalog.set_config('nuvio.skip_profile_defaults', v_prev_skip_defaults, true);")
+  ) {
+    throw new Error("Failed to inject dynamic skip_profile_defaults guard into sync_restore_account_backup");
+  }
+
+  return fnSql;
+}
+
 /** Transforms upstream self-hosted migration SQL to run safely as Supabase Cloud `postgres`. */
-export function sanitizeMigrationSql(rawSql, fileName) {
+export function sanitizeMigrationSql(rawSql, fileName, context = {}) {
   let sql = normalizeLf(rawSql);
 
   // Managed Supabase Cloud instances do not allow non-superuser `postgres` to create `supabase_monitor`.
@@ -58,6 +95,17 @@ export function sanitizeMigrationSql(rawSql, fileName) {
     /^([ \t]*)ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public\b/gm,
     "$1ALTER DEFAULT PRIVILEGES IN SCHEMA public",
   );
+
+  // Non-superuser roles on Postgres 15+ cannot attach custom GUCs via `ALTER FUNCTION ... SET nuvio.*`.
+  // Replace with dynamic transaction-local `set_config` inside `sync_restore_account_backup`.
+  if (fileName === "00000000000007_clean_account_restore.sql") {
+    const alterPattern = /ALTER FUNCTION public\.sync_restore_account_backup\(jsonb, text\)\s+SET nuvio\.skip_profile_defaults = 'on';/;
+    if (!alterPattern.test(sql)) {
+      throw new Error("Expected ALTER FUNCTION sync_restore_account_backup statement missing in 07_clean_account_restore.sql");
+    }
+    const replacementFn = buildCloudSafeSyncRestoreAccountBackup(context.baselineSql || "");
+    sql = sql.replace(alterPattern, replacementFn);
+  }
 
   // Collapse excess blank lines left by removed blocks while preserving single trailing newline.
   sql = sql.replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
@@ -123,9 +171,13 @@ export function buildExpectedSupabaseTree(rootDir = repoRoot) {
     .filter((name) => name.endsWith(".sql"))
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
+  const baselineSql = normalizeLf(
+    fs.readFileSync(path.join(migrationsDir, "00000000000000_baseline.sql"), "utf8"),
+  );
+
   for (const fileName of migrationFiles) {
     const rawSql = fs.readFileSync(path.join(migrationsDir, fileName), "utf8");
-    const sanitized = sanitizeMigrationSql(rawSql, fileName);
+    const sanitized = sanitizeMigrationSql(rawSql, fileName, { baselineSql });
     expected.set(`migrations/${fileName}`, Buffer.from(sanitized, "utf8"));
   }
 

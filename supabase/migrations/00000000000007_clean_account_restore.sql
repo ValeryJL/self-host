@@ -46,8 +46,495 @@ $$;
 
 -- Function-level settings are scoped to each invocation and restored on exit,
 -- so concurrent profile creation retains the normal default-seeding behavior.
-ALTER FUNCTION public.sync_restore_account_backup(jsonb, text)
-    SET nuvio.skip_profile_defaults = 'on';
+CREATE OR REPLACE FUNCTION public.sync_restore_account_backup(p_backup jsonb, p_mode text DEFAULT 'replace'::text) RETURNS jsonb
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, public, auth, extensions, pg_temp
+    AS $_$
+DECLARE
+    v_owner uuid;
+    v_mode text;
+    v_version integer;
+    v_data jsonb;
+    v_key text;
+    v_counts jsonb;
+    v_prev_skip_defaults text;
+BEGIN
+    v_prev_skip_defaults := COALESCE(pg_catalog.current_setting('nuvio.skip_profile_defaults', true), '');
+    PERFORM pg_catalog.set_config('nuvio.skip_profile_defaults', 'on', true);
+    v_owner := public.get_sync_owner();
+
+    IF v_owner IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '28000';
+    END IF;
+
+    v_mode := lower(COALESCE(NULLIF(btrim(p_mode), ''), 'replace'));
+
+    IF v_mode <> 'replace' THEN
+        RAISE EXCEPTION 'Unsupported restore mode: %. Only replace is supported.', v_mode
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_backup IS NULL OR jsonb_typeof(p_backup) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'Invalid Nuvio backup file' USING ERRCODE = '22023';
+    END IF;
+
+    IF p_backup->>'format' IS DISTINCT FROM 'nuvio_account_backup' THEN
+        RAISE EXCEPTION 'Unsupported Nuvio backup format' USING ERRCODE = '22023';
+    END IF;
+
+    IF COALESCE(p_backup->>'version', '') !~ '^[0-9]+$' THEN
+        RAISE EXCEPTION 'Unsupported Nuvio backup version' USING ERRCODE = '22023';
+    END IF;
+
+    v_version := (p_backup->>'version')::integer;
+
+    IF v_version <> 1 THEN
+        RAISE EXCEPTION 'Unsupported Nuvio backup version: %', v_version
+            USING ERRCODE = '22023';
+    END IF;
+
+    v_data := COALESCE(p_backup->'data', '{}'::jsonb);
+
+    IF jsonb_typeof(v_data) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'Invalid Nuvio backup data' USING ERRCODE = '22023';
+    END IF;
+
+    FOREACH v_key IN ARRAY ARRAY[
+        'profiles',
+        'addons',
+        'plugins',
+        'library_items',
+        'watch_progress',
+        'watched_items',
+        'profile_settings_blobs',
+        'home_catalog_settings',
+        'collections',
+        'profile_tracker_settings'
+    ]
+    LOOP
+        IF v_data ? v_key AND jsonb_typeof(v_data->v_key) IS DISTINCT FROM 'array' THEN
+            RAISE EXCEPTION 'Invalid Nuvio backup data section: %', v_key
+                USING ERRCODE = '22023';
+        END IF;
+    END LOOP;
+
+    INSERT INTO public.watch_progress_events (
+        user_id,
+        profile_id,
+        operation,
+        progress_key,
+        content_id,
+        content_type,
+        video_id,
+        season,
+        episode,
+        position,
+        duration,
+        last_watched
+    )
+    SELECT
+        user_id,
+        profile_id,
+        'delete',
+        progress_key,
+        content_id,
+        content_type,
+        COALESCE(video_id, ''),
+        season,
+        episode,
+        COALESCE(position, 0),
+        COALESCE(duration, 0),
+        COALESCE(last_watched, 0)
+    FROM public.watch_progress
+    WHERE user_id = v_owner;
+
+    INSERT INTO public.watched_item_events (
+        user_id,
+        profile_id,
+        operation,
+        content_id,
+        content_type,
+        title,
+        season,
+        episode,
+        watched_at
+    )
+    SELECT
+        user_id,
+        profile_id,
+        'delete',
+        content_id,
+        content_type,
+        COALESCE(title, ''),
+        season,
+        episode,
+        COALESCE(watched_at, 0)
+    FROM public.watched_items
+    WHERE user_id = v_owner;
+
+    DELETE FROM public.profile_tracker_settings WHERE user_id = v_owner;
+    DELETE FROM public.home_catalog_settings WHERE user_id = v_owner;
+    DELETE FROM public.profile_settings_blobs WHERE user_id = v_owner;
+    DELETE FROM public.collections WHERE user_id = v_owner;
+    DELETE FROM public.library_items WHERE user_id = v_owner;
+    DELETE FROM public.watch_progress WHERE user_id = v_owner;
+    DELETE FROM public.watched_items WHERE user_id = v_owner;
+    DELETE FROM public.addons WHERE user_id = v_owner;
+    DELETE FROM public.plugins WHERE user_id = v_owner;
+    DELETE FROM public.profiles WHERE user_id = v_owner;
+
+    INSERT INTO public.profiles (
+        user_id,
+        profile_index,
+        profile_id,
+        name,
+        avatar_color_hex,
+        uses_primary_addons,
+        uses_primary_plugins,
+        avatar_id,
+        avatar_url,
+        created_at,
+        updated_at
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_index', '')::integer, 1),
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, NULLIF(item.value->>'profile_index', '')::integer, 1),
+        COALESCE(item.value->>'name', ''),
+        COALESCE(NULLIF(item.value->>'avatar_color_hex', ''), '#1E88E5'),
+        CASE
+            WHEN COALESCE(NULLIF(item.value->>'profile_index', '')::integer, 1) = 1 THEN false
+            ELSE COALESCE((item.value->>'uses_primary_addons')::boolean, false)
+        END,
+        CASE
+            WHEN COALESCE(NULLIF(item.value->>'profile_index', '')::integer, 1) = 1 THEN false
+            ELSE COALESCE((item.value->>'uses_primary_plugins')::boolean, false)
+        END,
+        avatar.id,
+        NULLIF(item.value->>'avatar_url', ''),
+        COALESCE(NULLIF(item.value->>'created_at', '')::timestamptz, now()),
+        COALESCE(NULLIF(item.value->>'updated_at', '')::timestamptz, now())
+    FROM jsonb_array_elements(COALESCE(v_data->'profiles', '[]'::jsonb)) AS item(value)
+    LEFT JOIN public.avatar_catalog AS avatar
+        ON avatar.id = NULLIF(item.value->>'avatar_id', '')
+    WHERE jsonb_typeof(item.value) = 'object';
+
+    INSERT INTO public.addons (
+        user_id,
+        profile_id,
+        url,
+        name,
+        enabled,
+        sort_order,
+        created_at,
+        updated_at
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, 1),
+        NULLIF(item.value->>'url', ''),
+        NULLIF(item.value->>'name', ''),
+        COALESCE((item.value->>'enabled')::boolean, true),
+        COALESCE(NULLIF(item.value->>'sort_order', '')::integer, 0),
+        COALESCE(NULLIF(item.value->>'created_at', '')::timestamptz, now()),
+        COALESCE(NULLIF(item.value->>'updated_at', '')::timestamptz, now())
+    FROM jsonb_array_elements(COALESCE(v_data->'addons', '[]'::jsonb)) AS item(value)
+    WHERE jsonb_typeof(item.value) = 'object'
+        AND NULLIF(item.value->>'url', '') IS NOT NULL;
+
+    INSERT INTO public.plugins (
+        user_id,
+        profile_id,
+        url,
+        name,
+        enabled,
+        sort_order,
+        repo_type,
+        created_at,
+        updated_at
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, 1),
+        NULLIF(item.value->>'url', ''),
+        NULLIF(item.value->>'name', ''),
+        COALESCE((item.value->>'enabled')::boolean, true),
+        COALESCE(NULLIF(item.value->>'sort_order', '')::integer, 0),
+        NULLIF(item.value->>'repo_type', ''),
+        COALESCE(NULLIF(item.value->>'created_at', '')::timestamptz, now()),
+        COALESCE(NULLIF(item.value->>'updated_at', '')::timestamptz, now())
+    FROM jsonb_array_elements(COALESCE(v_data->'plugins', '[]'::jsonb)) AS item(value)
+    WHERE jsonb_typeof(item.value) = 'object'
+        AND NULLIF(item.value->>'url', '') IS NOT NULL;
+
+    INSERT INTO public.library_items (
+        user_id,
+        profile_id,
+        content_id,
+        content_type,
+        name,
+        poster,
+        poster_shape,
+        background,
+        description,
+        release_info,
+        imdb_rating,
+        genres,
+        addon_base_url,
+        added_at,
+        created_at,
+        updated_at
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, 1),
+        NULLIF(item.value->>'content_id', ''),
+        NULLIF(item.value->>'content_type', ''),
+        COALESCE(item.value->>'name', ''),
+        NULLIF(item.value->>'poster', ''),
+        COALESCE(NULLIF(item.value->>'poster_shape', ''), 'POSTER'),
+        NULLIF(item.value->>'background', ''),
+        NULLIF(item.value->>'description', ''),
+        NULLIF(item.value->>'release_info', ''),
+        NULLIF(item.value->>'imdb_rating', '')::real,
+        CASE
+            WHEN jsonb_typeof(item.value->'genres') = 'array'
+                THEN ARRAY(SELECT jsonb_array_elements_text(item.value->'genres'))
+            ELSE '{}'::text[]
+        END,
+        NULLIF(item.value->>'addon_base_url', ''),
+        COALESCE(NULLIF(item.value->>'added_at', '')::bigint, 0),
+        COALESCE(NULLIF(item.value->>'created_at', '')::timestamptz, now()),
+        COALESCE(NULLIF(item.value->>'updated_at', '')::timestamptz, now())
+    FROM jsonb_array_elements(COALESCE(v_data->'library_items', '[]'::jsonb)) AS item(value)
+    WHERE jsonb_typeof(item.value) = 'object'
+        AND NULLIF(item.value->>'content_id', '') IS NOT NULL
+        AND NULLIF(item.value->>'content_type', '') IS NOT NULL;
+
+    INSERT INTO public.watch_progress (
+        user_id,
+        profile_id,
+        content_id,
+        content_type,
+        video_id,
+        season,
+        episode,
+        position,
+        duration,
+        last_watched,
+        progress_key
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, 1),
+        NULLIF(item.value->>'content_id', ''),
+        NULLIF(item.value->>'content_type', ''),
+        COALESCE(item.value->>'video_id', ''),
+        NULLIF(item.value->>'season', '')::integer,
+        NULLIF(item.value->>'episode', '')::integer,
+        COALESCE(NULLIF(item.value->>'position', '')::bigint, 0),
+        COALESCE(NULLIF(item.value->>'duration', '')::bigint, 0),
+        COALESCE(NULLIF(item.value->>'last_watched', '')::bigint, 0),
+        NULLIF(item.value->>'progress_key', '')
+    FROM jsonb_array_elements(COALESCE(v_data->'watch_progress', '[]'::jsonb)) AS item(value)
+    WHERE jsonb_typeof(item.value) = 'object'
+        AND NULLIF(item.value->>'content_id', '') IS NOT NULL
+        AND NULLIF(item.value->>'content_type', '') IS NOT NULL
+        AND NULLIF(item.value->>'progress_key', '') IS NOT NULL;
+
+    INSERT INTO public.watched_items (
+        user_id,
+        profile_id,
+        content_id,
+        content_type,
+        title,
+        season,
+        episode,
+        watched_at,
+        created_at
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, 1),
+        NULLIF(item.value->>'content_id', ''),
+        COALESCE(NULLIF(item.value->>'content_type', ''), 'movie'),
+        COALESCE(item.value->>'title', ''),
+        NULLIF(item.value->>'season', '')::integer,
+        NULLIF(item.value->>'episode', '')::integer,
+        COALESCE(NULLIF(item.value->>'watched_at', '')::bigint, 0),
+        COALESCE(NULLIF(item.value->>'created_at', '')::timestamptz, now())
+    FROM jsonb_array_elements(COALESCE(v_data->'watched_items', '[]'::jsonb)) AS item(value)
+    WHERE jsonb_typeof(item.value) = 'object'
+        AND NULLIF(item.value->>'content_id', '') IS NOT NULL;
+
+    INSERT INTO public.profile_settings_blobs (
+        user_id,
+        profile_id,
+        platform,
+        settings_json,
+        created_at,
+        updated_at
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, 1),
+        COALESCE(NULLIF(item.value->>'platform', ''), 'tv'),
+        CASE
+            WHEN item.value ? 'settings_json' AND jsonb_typeof(item.value->'settings_json') <> 'null'
+                THEN item.value->'settings_json'
+            ELSE '{}'::jsonb
+        END,
+        COALESCE(NULLIF(item.value->>'created_at', '')::timestamptz, now()),
+        COALESCE(NULLIF(item.value->>'updated_at', '')::timestamptz, now())
+    FROM jsonb_array_elements(COALESCE(v_data->'profile_settings_blobs', '[]'::jsonb)) AS item(value)
+    WHERE jsonb_typeof(item.value) = 'object';
+
+    INSERT INTO public.home_catalog_settings (
+        user_id,
+        profile_id,
+        platform,
+        settings_json,
+        updated_at
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, 1),
+        COALESCE(NULLIF(item.value->>'platform', ''), 'tv'),
+        CASE
+            WHEN item.value ? 'settings_json' AND jsonb_typeof(item.value->'settings_json') <> 'null'
+                THEN item.value->'settings_json'
+            ELSE '{}'::jsonb
+        END,
+        COALESCE(NULLIF(item.value->>'updated_at', '')::timestamptz, now())
+    FROM jsonb_array_elements(COALESCE(v_data->'home_catalog_settings', '[]'::jsonb)) AS item(value)
+    WHERE jsonb_typeof(item.value) = 'object';
+
+    INSERT INTO public.collections (
+        user_id,
+        profile_id,
+        collections_json,
+        created_at,
+        updated_at
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, 1),
+        CASE
+            WHEN jsonb_typeof(item.value->'collections_json') = 'array'
+                THEN item.value->'collections_json'
+            ELSE '[]'::jsonb
+        END,
+        COALESCE(NULLIF(item.value->>'created_at', '')::timestamptz, now()),
+        COALESCE(NULLIF(item.value->>'updated_at', '')::timestamptz, now())
+    FROM jsonb_array_elements(COALESCE(v_data->'collections', '[]'::jsonb)) AS item(value)
+    WHERE jsonb_typeof(item.value) = 'object';
+
+    INSERT INTO public.profile_tracker_settings (
+        user_id,
+        profile_id,
+        tracker,
+        enabled_statuses,
+        row_order,
+        send_progress,
+        updated_at
+    )
+    SELECT
+        v_owner,
+        COALESCE(NULLIF(item.value->>'profile_id', '')::integer, 1),
+        NULLIF(item.value->>'tracker', ''),
+        CASE
+            WHEN jsonb_typeof(item.value->'enabled_statuses') = 'array'
+                THEN ARRAY(SELECT jsonb_array_elements_text(item.value->'enabled_statuses'))
+            ELSE '{}'::text[]
+        END,
+        CASE
+            WHEN jsonb_typeof(item.value->'row_order') = 'array'
+                THEN ARRAY(SELECT jsonb_array_elements_text(item.value->'row_order'))
+            ELSE '{}'::text[]
+        END,
+        COALESCE((item.value->>'send_progress')::boolean, true),
+        COALESCE(NULLIF(item.value->>'updated_at', '')::timestamptz, now())
+    FROM jsonb_array_elements(COALESCE(v_data->'profile_tracker_settings', '[]'::jsonb)) AS item(value)
+    WHERE jsonb_typeof(item.value) = 'object'
+        AND NULLIF(item.value->>'tracker', '') IS NOT NULL;
+
+    INSERT INTO public.watch_progress_events (
+        user_id,
+        profile_id,
+        operation,
+        progress_key,
+        content_id,
+        content_type,
+        video_id,
+        season,
+        episode,
+        position,
+        duration,
+        last_watched
+    )
+    SELECT
+        user_id,
+        profile_id,
+        'upsert',
+        progress_key,
+        content_id,
+        content_type,
+        COALESCE(video_id, ''),
+        season,
+        episode,
+        COALESCE(position, 0),
+        COALESCE(duration, 0),
+        COALESCE(last_watched, 0)
+    FROM public.watch_progress
+    WHERE user_id = v_owner;
+
+    INSERT INTO public.watched_item_events (
+        user_id,
+        profile_id,
+        operation,
+        content_id,
+        content_type,
+        title,
+        season,
+        episode,
+        watched_at
+    )
+    SELECT
+        user_id,
+        profile_id,
+        'upsert',
+        content_id,
+        content_type,
+        COALESCE(title, ''),
+        season,
+        episode,
+        COALESCE(watched_at, 0)
+    FROM public.watched_items
+    WHERE user_id = v_owner;
+
+    v_counts := jsonb_build_object(
+        'profiles', (SELECT COUNT(*) FROM public.profiles WHERE user_id = v_owner),
+        'addons', (SELECT COUNT(*) FROM public.addons WHERE user_id = v_owner),
+        'plugins', (SELECT COUNT(*) FROM public.plugins WHERE user_id = v_owner),
+        'library_items', (SELECT COUNT(*) FROM public.library_items WHERE user_id = v_owner),
+        'watch_progress', (SELECT COUNT(*) FROM public.watch_progress WHERE user_id = v_owner),
+        'watched_items', (SELECT COUNT(*) FROM public.watched_items WHERE user_id = v_owner),
+        'profile_settings_blobs', (SELECT COUNT(*) FROM public.profile_settings_blobs WHERE user_id = v_owner),
+        'home_catalog_settings', (SELECT COUNT(*) FROM public.home_catalog_settings WHERE user_id = v_owner),
+        'collections', (SELECT COUNT(*) FROM public.collections WHERE user_id = v_owner),
+        'profile_tracker_settings', (SELECT COUNT(*) FROM public.profile_tracker_settings WHERE user_id = v_owner)
+    );
+
+    PERFORM pg_catalog.set_config('nuvio.skip_profile_defaults', v_prev_skip_defaults, true);
+
+    RETURN jsonb_build_object(
+        'restored_at', to_jsonb(now()),
+        'mode', v_mode,
+        'counts', v_counts,
+        'sensitive_data_excluded', COALESCE(p_backup->'sensitive_data_excluded', '[]'::jsonb)
+    );
+END;
+$_$;
 
 INSERT INTO nuvio_migrations.schema_migrations (version)
 VALUES ('00000000000007')

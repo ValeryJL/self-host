@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildDiscoveryDocument, type DiscoveryEnv } from "../src/discovery.js";
-import worker from "../src/index.js";
+import worker, { handleRequest } from "../src/index.js";
 
 const SAMPLE_PUBLISHABLE_KEY = ["sb", "publishable", "example_public_key_value"].join("_");
 const SAMPLE_SECRET_KEY = ["sb", "secret", "example_should_never_leak"].join("_");
@@ -13,12 +13,9 @@ const VALID_ENV: DiscoveryEnv = {
   WATCH_PARTY_ENABLED: "false",
 };
 
-function makeCtx() {
-  return {
-    waitUntil() {},
-    passThroughOnException() {},
-  };
-}
+test("worker exports default fetch handler", () => {
+  assert.equal(typeof worker.fetch, "function");
+});
 
 test("buildDiscoveryDocument normalizes trailing slash and matches upstream contract", () => {
   const result = buildDiscoveryDocument(VALID_ENV);
@@ -80,7 +77,7 @@ test("buildDiscoveryDocument rejects missing values, secret keys, query strings,
 
 test("GET /.well-known/nuvio returns 200 JSON with CORS headers", async () => {
   const req = new Request("https://nuvio.example.workers.dev/.well-known/nuvio", { method: "GET" });
-  const res = await worker.fetch!(req, VALID_ENV, makeCtx());
+  const res = await handleRequest(req, VALID_ENV);
 
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("content-type"), "application/json; charset=utf-8");
@@ -99,18 +96,16 @@ test("GET /.well-known/nuvio returns 200 JSON with CORS headers", async () => {
 });
 
 test("POST /.well-known/nuvio returns 405 and OPTIONS returns 204", async () => {
-  const postRes = await worker.fetch!(
+  const postRes = await handleRequest(
     new Request("https://nuvio.example.workers.dev/.well-known/nuvio", { method: "POST" }),
     VALID_ENV,
-    makeCtx(),
   );
   assert.equal(postRes.status, 405);
   assert.equal(postRes.headers.get("allow"), "GET, HEAD, OPTIONS");
 
-  const optionsRes = await worker.fetch!(
+  const optionsRes = await handleRequest(
     new Request("https://nuvio.example.workers.dev/.well-known/nuvio", { method: "OPTIONS" }),
     VALID_ENV,
-    makeCtx(),
   );
   assert.equal(optionsRes.status, 204);
   assert.equal(optionsRes.headers.get("access-control-allow-origin"), "*");
@@ -122,19 +117,17 @@ test("unconfigured Worker returns 503 on /.well-known/nuvio and /health without 
     SUPABASE_PUBLISHABLE_KEY: SAMPLE_SECRET_KEY,
   };
 
-  const discoveryRes = await worker.fetch!(
+  const discoveryRes = await handleRequest(
     new Request("https://nuvio.example.workers.dev/.well-known/nuvio"),
     env,
-    makeCtx(),
   );
   assert.equal(discoveryRes.status, 503);
   const discoveryText = await discoveryRes.text();
   assert.equal(discoveryText.includes(SAMPLE_SECRET_KEY), false);
 
-  const healthRes = await worker.fetch!(
+  const healthRes = await handleRequest(
     new Request("https://nuvio.example.workers.dev/healthz"),
     env,
-    makeCtx(),
   );
   assert.equal(healthRes.status, 503);
   const healthText = await healthRes.text();
@@ -142,28 +135,25 @@ test("unconfigured Worker returns 503 on /.well-known/nuvio and /health without 
 });
 
 test("HEAD, root info, and unknown paths behave cleanly", async () => {
-  const headRes = await worker.fetch!(
+  const headRes = await handleRequest(
     new Request("https://nuvio.example.workers.dev/.well-known/nuvio", { method: "HEAD" }),
     VALID_ENV,
-    makeCtx(),
   );
   assert.equal(headRes.status, 200);
   assert.equal(await headRes.text(), "");
 
-  const rootRes = await worker.fetch!(
+  const rootRes = await handleRequest(
     new Request("https://nuvio.example.workers.dev/"),
     VALID_ENV,
-    makeCtx(),
   );
   assert.equal(rootRes.status, 200);
   const rootJson = (await rootRes.json()) as { configured: boolean; discovery_url: string };
   assert.equal(rootJson.configured, true);
   assert.equal(rootJson.discovery_url, "https://nuvio.example.workers.dev/.well-known/nuvio");
 
-  const notFoundRes = await worker.fetch!(
+  const notFoundRes = await handleRequest(
     new Request("https://nuvio.example.workers.dev/unknown"),
     VALID_ENV,
-    makeCtx(),
   );
   assert.equal(notFoundRes.status, 404);
 });

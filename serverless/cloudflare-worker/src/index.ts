@@ -26,7 +26,12 @@ function logRequest(pathname: string, method: string, status: number, configured
   );
 }
 
-function handleDiscovery(request: Request, validation: ReturnType<typeof buildDiscoveryDocument>): Response {
+interface RequestLike {
+  readonly method: string;
+  readonly url: string;
+}
+
+function handleDiscovery(request: RequestLike, validation: ReturnType<typeof buildDiscoveryDocument>): Response {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return jsonResponse(
       { error: "method_not_allowed", message: "Use GET or HEAD for discovery." },
@@ -51,7 +56,7 @@ function handleDiscovery(request: Request, validation: ReturnType<typeof buildDi
   return jsonResponse(validation.document, 200, request.method);
 }
 
-function handleHealth(request: Request, validation: ReturnType<typeof buildDiscoveryDocument>): Response {
+function handleHealth(request: RequestLike, validation: ReturnType<typeof buildDiscoveryDocument>): Response {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return jsonResponse(
       { error: "method_not_allowed" },
@@ -87,7 +92,7 @@ function handleHealth(request: Request, validation: ReturnType<typeof buildDisco
   );
 }
 
-function handleRoot(request: Request, url: URL, validation: ReturnType<typeof buildDiscoveryDocument>): Response {
+function handleRoot(request: RequestLike, url: URL, validation: ReturnType<typeof buildDiscoveryDocument>): Response {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return jsonResponse(
       { error: "method_not_allowed" },
@@ -109,28 +114,33 @@ function handleRoot(request: Request, url: URL, validation: ReturnType<typeof bu
   );
 }
 
+/** Handles incoming discovery, health, and CORS preflight requests for the Worker. */
+export async function handleRequest(request: RequestLike, env: DiscoveryEnv): Promise<Response> {
+  const startMs = Date.now();
+  const url = new URL(request.url);
+  const pathname = normalizePathname(url.pathname);
+  const validation = buildDiscoveryDocument(env);
+
+  let response: Response;
+  if (request.method === "OPTIONS") {
+    response = new Response(null, { status: 204, headers: CORS_HEADERS });
+  } else if (pathname === DISCOVERY_PATH) {
+    response = handleDiscovery(request, validation);
+  } else if (pathname === "/health" || pathname === "/healthz") {
+    response = handleHealth(request, validation);
+  } else if (pathname === "/") {
+    response = handleRoot(request, url, validation);
+  } else {
+    response = jsonResponse({ error: "not_found" }, 404, request.method);
+  }
+
+  logRequest(pathname, request.method, response.status, validation.ok, startMs);
+  return response;
+}
+
 const worker: ExportedHandler<DiscoveryEnv> = {
   async fetch(request: Request, env: DiscoveryEnv): Promise<Response> {
-    const startMs = Date.now();
-    const url = new URL(request.url);
-    const pathname = normalizePathname(url.pathname);
-    const validation = buildDiscoveryDocument(env);
-
-    let response: Response;
-    if (request.method === "OPTIONS") {
-      response = new Response(null, { status: 204, headers: CORS_HEADERS });
-    } else if (pathname === DISCOVERY_PATH) {
-      response = handleDiscovery(request, validation);
-    } else if (pathname === "/health" || pathname === "/healthz") {
-      response = handleHealth(request, validation);
-    } else if (pathname === "/") {
-      response = handleRoot(request, url, validation);
-    } else {
-      response = jsonResponse({ error: "not_found" }, 404, request.method);
-    }
-
-    logRequest(pathname, request.method, response.status, validation.ok, startMs);
-    return response;
+    return handleRequest(request, env);
   },
 };
 
