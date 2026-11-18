@@ -95,6 +95,7 @@ jobs:
           $$;
 
           GRANT anon, authenticated, service_role TO nuvio_cloud_postgres;
+          GRANT CREATE ON DATABASE postgres TO nuvio_cloud_postgres;
           ALTER SCHEMA public OWNER TO nuvio_cloud_postgres;
           GRANT USAGE, CREATE ON SCHEMA public TO nuvio_cloud_postgres;
 
@@ -223,9 +224,7 @@ jobs:
         run: npm install --no-audit --no-fund
 
       - name: Generate Wrangler types and check TypeScript
-        run: |
-          npm run cf-typegen
-          npm run typecheck
+        run: npm run typecheck
 
       - name: Run Discovery Worker unit tests
         run: npm test

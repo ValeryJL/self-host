@@ -20,3 +20,4 @@ serverless/cloudflare-worker/.dev.vars
 serverless/cloudflare-worker/.tmp-test/
 serverless/cloudflare-worker/.wrangler/
 serverless/cloudflare-worker/node_modules/
+serverless/cloudflare-worker/worker-configuration.d.ts
