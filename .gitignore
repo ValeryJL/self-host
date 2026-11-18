@@ -14,3 +14,9 @@ dashboard/
 *.dump
 *.sql.gz
 .DS_Store
+supabase/.temp/
+supabase/.branches/
+serverless/cloudflare-worker/.dev.vars
+serverless/cloudflare-worker/.tmp-test/
+serverless/cloudflare-worker/.wrangler/
+serverless/cloudflare-worker/node_modules/

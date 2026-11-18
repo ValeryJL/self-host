@@ -83,3 +83,13 @@ The dashboard is available at `http://localhost:3000`, and the backend is at
 
 Licensed under the Apache License 2.0. See [LICENSE](LICENSE) and
 [NOTICE](NOTICE).
+
+## Serverless Deployment (Supabase Cloud + Cloudflare Workers)
+
+Prefer running without Docker or a VPS? Use the serverless setup in [`serverless/`](serverless/README.md) to host Postgres, Auth, Storage, Realtime, and Edge Functions on **Supabase Cloud**, paired with a lightweight discovery Worker on **Cloudflare Workers**:
+
+- [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ValeryJL/self-host/tree/main/serverless/cloudflare-worker)
+- [![Create Supabase Project](https://img.shields.io/badge/Create_Project-Supabase-3FCF8E?logo=supabase&logoColor=white)](https://supabase.com/dashboard/new)
+- [![Deploy via GitHub Actions](https://img.shields.io/badge/Deploy_Backend-GitHub_Actions-2088FF?logo=github-actions&logoColor=white)](https://github.com/ValeryJL/self-host/actions/workflows/deploy-serverless.yml)
+
+See the [Serverless Deployment Guide](serverless/README.md) for step-by-step instructions, required secrets, and client connection details.

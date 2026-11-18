@@ -1,0 +1,224 @@
+name: Deploy Serverless Backend
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_supabase:
+        description: "Push database migrations, deploy Edge Functions, and seed avatars on Supabase Cloud"
+        type: boolean
+        required: true
+        default: true
+      deploy_cloudflare_worker:
+        description: "Deploy /.well-known/nuvio discovery Worker to Cloudflare Workers"
+        type: boolean
+        required: true
+        default: true
+      default_catalog_url:
+        description: "Default catalog addon URL saved in nuvio_private.instance_settings"
+        type: string
+        required: true
+        default: "https://catalog.nuvio.tv/manifest.json"
+      tv_login_enabled:
+        description: "Expose tv_login=true capability in /.well-known/nuvio"
+        type: boolean
+        required: true
+        default: true
+      watch_party_enabled:
+        description: "Expose optional watch_party=true capability in /.well-known/nuvio"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-supabase:
+    if: ${{ inputs.deploy_supabase }}
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate required Supabase GitHub Secrets
+        run: |
+          missing=0
+          for name in SUPABASE_ACCESS_TOKEN SUPABASE_PROJECT_REF SUPABASE_DB_PASSWORD; do
+            val=$(eval "printf '%s' \"\${$name:-}\"")
+            if [ -z "$val" ]; then
+              echo "::error::Missing repository secret: $name"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+      - name: Verify generated supabase directory matches upstream SQL and Edge Functions
+        run: node serverless/supabase/prepare.mjs --check
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Link project and push migrations
+        run: |
+          supabase link --project-ref "$SUPABASE_PROJECT_REF"
+          if supabase db push --help 2>&1 | grep -q -- '--remote'; then
+            supabase db push --remote --yes
+          else
+            supabase db push
+          fi
+
+      - name: Apply custom default_catalog_url setting
+        env:
+          INPUT_CATALOG_URL: ${{ inputs.default_catalog_url }}
+        run: |
+          if [ -z "$INPUT_CATALOG_URL" ]; then
+            exit 0
+          fi
+          case "$INPUT_CATALOG_URL" in
+            http://*|https://*) ;;
+            *) echo "::error::default_catalog_url must use http:// or https://"; exit 1 ;;
+          esac
+
+          payload=$(node -e '
+            const url = process.env.INPUT_CATALOG_URL.trim();
+            const escaped = url.replace(/\x27/g, "\x27\x27");
+            const sql = `INSERT INTO nuvio_private.instance_settings (key, value, updated_at) VALUES (\x27default_catalog_url\x27, \x27${escaped}\x27, now()) ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;`;
+            process.stdout.write(JSON.stringify({ query: sql }));
+          ')
+
+          curl --fail-with-body -sS -o /dev/null \
+            -X POST \
+            -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "https://api.supabase.com/v1/projects/$SUPABASE_PROJECT_REF/database/query"
+
+      - name: Deploy Nuvio Edge Functions
+        run: |
+          for fn in delete-account health-check tracker-tv-logins-exchange tv-logins-exchange; do
+            echo "Deploying Edge Function: $fn"
+            supabase functions deploy "$fn" --project-ref "$SUPABASE_PROJECT_REF" --use-api --no-verify-jwt
+          done
+
+      - name: Seed catalog avatars in Storage (when SUPABASE_SERVICE_ROLE_KEY secret is configured)
+        run: |
+          if [ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
+            echo "SUPABASE_SERVICE_ROLE_KEY secret not set; skipping avatar seeding."
+            exit 0
+          fi
+          storage_url="https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object"
+          present=0
+          uploaded=0
+          for asset in assets/avatars/*.png; do
+            [ -f "$asset" ] || continue
+            name=$(basename "$asset")
+            present=$((present + 1))
+            if curl -fsSI -o /dev/null "$storage_url/public/avatars/$name" 2>/dev/null; then
+              continue
+            fi
+            curl --fail-with-body -sS -o /dev/null \
+              -X POST \
+              -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Content-Type: image/png" \
+              -H "Cache-Control: public, max-age=31536000, immutable" \
+              -H "x-upsert: true" \
+              --data-binary "@$asset" \
+              "$storage_url/avatars/$name"
+            uploaded=$((uploaded + 1))
+          done
+          echo "OK  Avatars ready ($present present, $uploaded uploaded)"
+
+      - name: Verify Supabase endpoints (when SUPABASE_PUBLISHABLE_KEY secret is configured)
+        run: |
+          if [ -z "${SUPABASE_PUBLISHABLE_KEY:-}" ]; then
+            echo "SUPABASE_PUBLISHABLE_KEY secret not set; skipping endpoint checks."
+            exit 0
+          fi
+          base="https://${SUPABASE_PROJECT_REF}.supabase.co"
+          curl -fsS -o /dev/null -H "apikey: $SUPABASE_PUBLISHABLE_KEY" "$base/auth/v1/health"
+          curl -fsS -o /dev/null -X POST -H "apikey: $SUPABASE_PUBLISHABLE_KEY" -H "Authorization: Bearer $SUPABASE_PUBLISHABLE_KEY" "$base/rest/v1/rpc/health_ping"
+          curl -fsS -o /dev/null -H "apikey: $SUPABASE_PUBLISHABLE_KEY" "$base/storage/v1/status"
+          curl -fsS -o /dev/null -H "apikey: $SUPABASE_PUBLISHABLE_KEY" "$base/functions/v1/health-check"
+          echo "OK  Supabase Auth, PostgREST, Storage, and Edge Functions verified."
+
+      - name: Write deployment summary
+        run: |
+          {
+            echo "### Supabase Cloud Deployed"
+            echo ""
+            echo "- Project URL: \`https://${SUPABASE_PROJECT_REF}.supabase.co\`"
+            echo "- Default catalog: \`${{ inputs.default_catalog_url }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-cloudflare-worker:
+    needs: deploy-supabase
+    if: ${{ !cancelled() && inputs.deploy_cloudflare_worker && (needs.deploy-supabase.result == 'success' || needs.deploy-supabase.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: serverless/cloudflare-worker
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+      TV_LOGIN_ENABLED: ${{ inputs.tv_login_enabled }}
+      WATCH_PARTY_ENABLED: ${{ inputs.watch_party_enabled }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate Cloudflare and Supabase discovery secrets
+        run: |
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID SUPABASE_PUBLISHABLE_KEY; do
+            val=$(eval "printf '%s' \"\${$name:-}\"")
+            if [ -z "$val" ]; then
+              echo "::error::Missing repository secret: $name"
+              missing=1
+            fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${SUPABASE_PROJECT_REF:-}" ]; then
+            echo "::error::Provide either SUPABASE_URL or SUPABASE_PROJECT_REF repository secret."
+            missing=1
+          fi
+          [ "$missing" -eq 0 ]
+
+      - name: Install dependencies and run Worker tests
+        run: |
+          npm install --no-audit --no-fund
+          npm run cf-typegen
+          npm run typecheck
+          npm test
+
+      - name: Deploy Worker to Cloudflare
+        run: |
+          trap 'rm -f .wrangler-deploy.json' EXIT
+          node -e '
+            const fs = require("node:fs");
+            const cfg = JSON.parse(fs.readFileSync("wrangler.jsonc", "utf8"));
+            const supabaseUrl = (process.env.SUPABASE_URL || `https://${process.env.SUPABASE_PROJECT_REF}.supabase.co`).replace(/\/+$/, "");
+            cfg.vars = {
+              SUPABASE_URL: supabaseUrl,
+              SUPABASE_PUBLISHABLE_KEY: process.env.SUPABASE_PUBLISHABLE_KEY.trim(),
+              TV_LOGIN_ENABLED: String(process.env.TV_LOGIN_ENABLED),
+              WATCH_PARTY_ENABLED: String(process.env.WATCH_PARTY_ENABLED),
+            };
+            fs.writeFileSync(".wrangler-deploy.json", JSON.stringify(cfg, null, 2));
+          '
+          npx wrangler deploy --config .wrangler-deploy.json

@@ -1,0 +1,35 @@
+{
+  "name": "nuvio-serverless-discovery",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker serving Nuvio /.well-known/nuvio backend discovery for serverless Supabase Cloud deployments.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "build-test": "tsc -p tsconfig.test.json",
+    "test": "npm run build-test && node --test .tmp-test/test/discovery.test.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "wrangler": "^4.4.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "SUPABASE_URL": {
+        "description": "Your Supabase project URL (e.g. https://<project-ref>.supabase.co) from Supabase Dashboard -> Project Settings -> Data API."
+      },
+      "SUPABASE_PUBLISHABLE_KEY": {
+        "description": "Your Supabase public client key (sb_publishable_... or anon JWT) from Supabase Dashboard -> Project Settings -> API Keys. Never use a service_role or secret key."
+      },
+      "TV_LOGIN_ENABLED": {
+        "description": "Set to \"true\" to advertise TV login support in discovery capabilities, or \"false\" to disable it."
+      },
+      "WATCH_PARTY_ENABLED": {
+        "description": "Optional experimental capability flag (\"false\" by default)."
+      }
+    }
+  }
+}

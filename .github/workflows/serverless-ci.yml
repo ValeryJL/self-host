@@ -1,0 +1,234 @@
+name: Serverless CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "serverless/**"
+      - "supabase/**"
+      - "database/**"
+      - "volumes/functions/**"
+      - "assets/avatars/**"
+      - ".github/workflows/serverless-ci.yml"
+      - ".github/workflows/deploy-serverless.yml"
+  pull_request:
+    paths:
+      - "serverless/**"
+      - "supabase/**"
+      - "database/**"
+      - "volumes/functions/**"
+      - "assets/avatars/**"
+      - ".github/workflows/serverless-ci.yml"
+      - ".github/workflows/deploy-serverless.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  supabase-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify supabase directory is in sync with upstream sources
+        run: node serverless/supabase/prepare.mjs --check
+
+      - name: Check POSIX shell script syntax
+        run: sh -n serverless/supabase/deploy.sh
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Verify Supabase CLI parses project structure
+        run: supabase --version
+
+  postgres-cloud-migration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_postgres_password
+          POSTGRES_DB: postgres
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=12
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGDATABASE: postgres
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ensure psql client is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+
+      - name: Initialize simulated Supabase Cloud baseline roles and schemas
+        env:
+          PGPASSWORD: ci_postgres_password
+        run: |
+          psql -v ON_ERROR_STOP=1 -U postgres <<'SQL'
+          DO $$
+          BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN CREATE ROLE anon NOLOGIN NOINHERIT; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN CREATE ROLE authenticated NOLOGIN NOINHERIT; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN CREATE ROLE service_role NOLOGIN NOINHERIT BYPASSRLS; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticator') THEN CREATE ROLE authenticator NOINHERIT; END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nuvio_cloud_postgres') THEN CREATE ROLE nuvio_cloud_postgres LOGIN PASSWORD 'ci_cloud_password' NOSUPERUSER NOCREATEROLE NOCREATEDB; END IF;
+          END
+          $$;
+
+          GRANT anon, authenticated, service_role TO nuvio_cloud_postgres;
+          ALTER SCHEMA public OWNER TO nuvio_cloud_postgres;
+          GRANT USAGE, CREATE ON SCHEMA public TO nuvio_cloud_postgres;
+
+          CREATE SCHEMA IF NOT EXISTS extensions;
+          CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;
+          GRANT USAGE ON SCHEMA extensions TO nuvio_cloud_postgres, anon, authenticated, service_role, PUBLIC;
+
+          CREATE SCHEMA IF NOT EXISTS auth;
+          ALTER SCHEMA auth OWNER TO nuvio_cloud_postgres;
+          GRANT USAGE ON SCHEMA auth TO nuvio_cloud_postgres, anon, authenticated, service_role;
+
+          CREATE TABLE IF NOT EXISTS auth.users (
+              id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              email text,
+              encrypted_password text,
+              raw_app_meta_data jsonb DEFAULT '{}'::jsonb,
+              raw_user_meta_data jsonb DEFAULT '{}'::jsonb,
+              is_anonymous boolean NOT NULL DEFAULT false,
+              created_at timestamptz DEFAULT now(),
+              updated_at timestamptz DEFAULT now()
+          );
+          ALTER TABLE auth.users OWNER TO nuvio_cloud_postgres;
+
+          CREATE TABLE IF NOT EXISTS auth.sessions (
+              id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+              created_at timestamptz DEFAULT now(),
+              updated_at timestamptz DEFAULT now()
+          );
+          ALTER TABLE auth.sessions OWNER TO nuvio_cloud_postgres;
+
+          CREATE OR REPLACE FUNCTION auth.uid()
+          RETURNS uuid
+          LANGUAGE sql
+          STABLE
+          AS $$
+              SELECT NULLIF(current_setting('request.jwt.claim.sub', true), '')::uuid;
+          $$;
+          ALTER FUNCTION auth.uid() OWNER TO nuvio_cloud_postgres;
+
+          CREATE OR REPLACE FUNCTION auth.jwt()
+          RETURNS jsonb
+          LANGUAGE sql
+          STABLE
+          AS $$
+              SELECT COALESCE(NULLIF(current_setting('request.jwt.claims', true), '')::jsonb, '{}'::jsonb);
+          $$;
+          ALTER FUNCTION auth.jwt() OWNER TO nuvio_cloud_postgres;
+
+          CREATE SCHEMA IF NOT EXISTS storage;
+          ALTER SCHEMA storage OWNER TO nuvio_cloud_postgres;
+          GRANT USAGE ON SCHEMA storage TO nuvio_cloud_postgres, anon, authenticated, service_role;
+
+          CREATE TABLE IF NOT EXISTS storage.buckets (
+              id text PRIMARY KEY,
+              name text NOT NULL,
+              public boolean DEFAULT false,
+              file_size_limit bigint,
+              allowed_mime_types text[]
+          );
+          ALTER TABLE storage.buckets OWNER TO nuvio_cloud_postgres;
+
+          CREATE TABLE IF NOT EXISTS storage.objects (
+              id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              bucket_id text REFERENCES storage.buckets(id),
+              name text,
+              owner uuid,
+              created_at timestamptz DEFAULT now(),
+              updated_at timestamptz DEFAULT now()
+          );
+          ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE storage.objects OWNER TO nuvio_cloud_postgres;
+          SQL
+
+      - name: Apply all Supabase Cloud migrations as non-superuser role
+        env:
+          PGPASSWORD: ci_cloud_password
+        run: |
+          for migration in supabase/migrations/*.sql; do
+            echo "Applying $migration"
+            psql -v ON_ERROR_STOP=1 -U nuvio_cloud_postgres < "$migration"
+          done
+
+      - name: Verify resulting database schema invariants
+        env:
+          PGPASSWORD: ci_cloud_password
+        run: |
+          assert_eq() {
+            label=$1
+            expected=$2
+            actual=$3
+            if [ "$actual" != "$expected" ]; then
+              echo "FAIL $label: expected $expected, got $actual" >&2
+              exit 1
+            fi
+            echo "OK   $label ($actual)"
+          }
+
+          q() {
+            psql -U nuvio_cloud_postgres -Atc "$1"
+          }
+
+          assert_eq "public tables" 23 "$(q "select count(*) from information_schema.tables where table_schema='public' and table_type='BASE TABLE'")"
+          assert_eq "public RLS policies" 19 "$(q "select count(*) from pg_policies where schemaname='public'")"
+          assert_eq "auth trigger" 1 "$(q "select count(*) from pg_trigger t join pg_class c on c.oid=t.tgrelid join pg_namespace n on n.oid=c.relnamespace where n.nspname='auth' and c.relname='users' and t.tgname='on_auth_user_created_addons'")"
+          assert_eq "storage policy" 1 "$(q "select count(*) from pg_policies where schemaname='storage' and tablename='objects' and policyname='Public avatar read access'")"
+          assert_eq "storage buckets" 2 "$(q "select count(*) from storage.buckets where id in ('avatars', 'covers')")"
+          assert_eq "Nuvio migrations" 12 "$(q "select count(*) from nuvio_migrations.schema_migrations")"
+          assert_eq "private default_catalog_url" 1 "$(q "select count(*) from nuvio_private.instance_settings where key='default_catalog_url'")"
+          assert_eq "avatar catalog rows" 41 "$(q "select count(*) from public.avatar_catalog where is_active")"
+          assert_eq "unhardened security definer functions" 0 "$(q "select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.prosecdef and coalesce(array_to_string(p.proconfig, ','), '') not like 'search_path=pg_catalog, public, auth, extensions, pg_temp%'")"
+
+  cloudflare-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: serverless/cloudflare-worker
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Worker dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Generate Wrangler types and check TypeScript
+        run: |
+          npm run cf-typegen
+          npm run typecheck
+
+      - name: Run Discovery Worker unit tests
+        run: npm test
+
+      - name: Dry-run Wrangler bundle and configuration check
+        run: npx wrangler deploy --dry-run
