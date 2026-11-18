@@ -47,11 +47,16 @@ export function sanitizeMigrationSql(rawSql, fileName) {
     "SELECT pg_catalog.set_config('search_path', '', true);",
   );
 
-  // Strip self-hosted monitoring grants and `supabase_admin` default privileges (`postgres` defaults stay intact).
+  // Strip self-hosted monitoring grants and `supabase_admin` default privileges.
   sql = sql.replace(/^[ \t]*GRANT\s+[^\n;]*\s+TO\s+supabase_monitor;\n?/gm, "");
   sql = sql.replace(
     /^[ \t]*ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin\b[^\n;]*;\n?/gm,
     "",
+  );
+  // Omit explicit `FOR ROLE postgres` so default privileges bind cleanly to whichever owner role runs migrations.
+  sql = sql.replace(
+    /^([ \t]*)ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public\b/gm,
+    "$1ALTER DEFAULT PRIVILEGES IN SCHEMA public",
   );
 
   // Collapse excess blank lines left by removed blocks while preserving single trailing newline.
