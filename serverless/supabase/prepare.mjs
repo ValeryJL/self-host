@@ -104,7 +104,8 @@ export function sanitizeMigrationSql(rawSql, fileName, context = {}) {
       throw new Error("Expected ALTER FUNCTION sync_restore_account_backup statement missing in 07_clean_account_restore.sql");
     }
     const replacementFn = buildCloudSafeSyncRestoreAccountBackup(context.baselineSql || "");
-    sql = sql.replace(alterPattern, replacementFn);
+    // Use function replacer so `$_$;` in SQL is never interpreted as a String.replace pattern.
+    sql = sql.replace(alterPattern, () => replacementFn);
   }
 
   // Collapse excess blank lines left by removed blocks while preserving single trailing newline.
